@@ -26,6 +26,7 @@ from wechat_crypto import (
     decrypt_legacy_msg_db,
     decrypt_sqlcipher4_db,
     derive_emoticon_key,
+    emoticon_cdn_map_from_db,
     favorite_md5s_from_db,
     looks_like_image,
     parse_hex_key,
@@ -34,11 +35,34 @@ from wechat_crypto import (
 )
 
 if sys.platform == "darwin":
-    from mac_seed_scan import find_emoticon_key_from_memory, find_encrypted_sample, scan_seed_candidates
+    from mac_seed_scan import (
+        find_db_key_from_memory,
+        find_emoticon_key_from_memory,
+        find_encrypted_sample,
+        scan_seed_candidates,
+    )
 
 HOME = Path.home()
 LIBRARY = Path(os.environ.get("WXMEME_LIBRARY", HOME / "Downloads" / "wxmeme" / "library"))
 PORT = int(os.environ.get("WXMEME_PORT", "8765"))
+
+_export_status = {"done": True, "phase": "idle", "message": "", "current": 0, "total": 0}
+_export_lock = threading.Lock()
+
+
+def export_status_reset() -> None:
+    with _export_lock:
+        _export_status.update(done=False, phase="start", message="准备导出…", current=0, total=0)
+
+
+def export_status_snapshot() -> dict:
+    with _export_lock:
+        return dict(_export_status)
+
+
+def _set_export_status(**kwargs) -> None:
+    with _export_lock:
+        _export_status.update(kwargs)
 
 MAGICS = (
     (b"\x89PNG\r\n\x1a\n", "png", "image/png"),
@@ -57,6 +81,8 @@ class ExportConfig:
     wxid: str | None = None
     seed: str | None = None
     use_cdn: bool = False
+    force_fav_archive: bool = False
+    sync_persist: bool = False
 
 
 @dataclass
@@ -66,16 +92,46 @@ class FavEntry:
 
 
 def wechat_roots() -> list[Path]:
-    roots = [
-        HOME / "Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat",
-        HOME / "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files",
-        HOME / "Documents/WeChat Files",
-        HOME / "Documents/xwechat_files",
-    ]
+    roots: list[Path] = []
+    if sys.platform == "win32":
+        appdata = Path(os.environ.get("APPDATA", HOME / "AppData" / "Roaming"))
+        localappdata = Path(os.environ.get("LOCALAPPDATA", HOME / "AppData" / "Local"))
+        roots.extend(
+            [
+                HOME / "Documents" / "WeChat Files",
+                HOME / "Documents" / "xwechat_files",
+                appdata / "Tencent" / "WeChat",
+                localappdata / "Tencent" / "WeChat",
+            ]
+        )
+        for base in (HOME / "Documents" / "WeChat Files", HOME / "Documents" / "xwechat_files"):
+            if base.is_dir():
+                for child in base.iterdir():
+                    if child.is_dir() and child.name.lower().startswith("wxid_"):
+                        roots.append(child)
+    else:
+        roots.extend(
+            [
+                HOME / "Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat",
+                HOME / "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files",
+                HOME / "Documents/WeChat Files",
+                HOME / "Documents/xwechat_files",
+            ]
+        )
     extra = os.environ.get("WXMEME_WECHAT_ROOT")
     if extra:
         roots.insert(0, Path(extra).expanduser())
-    return [p for p in roots if p.exists()]
+    seen: set[str] = set()
+    found: list[Path] = []
+    for path in roots:
+        if not path.exists():
+            continue
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(path)
+    return found
 
 
 @dataclass
@@ -102,6 +158,15 @@ def discover_paths() -> WeChatPaths:
                     path = root / sub
                     if path.is_dir():
                         emoticon_dirs.append(path)
+                if sys.platform == "win32":
+                    for sub in (
+                        "FileStorage/CustomEmotion",
+                        "FileStorage/CustomEmoticon",
+                        "CustomEmotion",
+                    ):
+                        path = root / sub
+                        if path.is_dir():
+                            emoticon_dirs.append(path)
 
         xwechat = root / "xwechat_files" if root.name != "xwechat_files" else root
         if xwechat.is_dir():
@@ -115,6 +180,15 @@ def discover_paths() -> WeChatPaths:
                             path = child / sub
                             if path.is_dir():
                                 emoticon_dirs.append(path)
+                        if sys.platform == "win32":
+                            for sub in (
+                                "FileStorage/CustomEmotion",
+                                "FileStorage/CustomEmoticon",
+                                "CustomEmotion",
+                            ):
+                                path = child / sub
+                                if path.is_dir():
+                                    emoticon_dirs.append(path)
 
     sticker_index: dict[str, Path] = {}
     for library_dir in library_dirs:
@@ -139,6 +213,10 @@ def discover_paths() -> WeChatPaths:
                         md5 = path.name.lower()
                         if len(md5) == 32:
                             sticker_index.setdefault(md5, path)
+        if sys.platform == "win32" and emo_dir.is_dir():
+            for path in emo_dir.iterdir():
+                if path.is_file() and len(path.name) == 32:
+                    sticker_index.setdefault(path.name.lower(), path)
 
     return WeChatPaths(
         library_dirs=library_dirs,
@@ -176,6 +254,8 @@ def load_plist(path: Path) -> dict:
         with path.open("rb") as handle:
             return plistlib.load(handle)
     except Exception:
+        if sys.platform != "darwin":
+            raise RuntimeError(f"无法读取 {path}") from None
         converted = subprocess.run(
             ["plutil", "-convert", "xml1", "-o", "-", str(path)],
             capture_output=True,
@@ -216,8 +296,118 @@ def ordered_md5s_from_fav(fav_archive: Path) -> list[str]:
     return [entry.md5 for entry in ordered_fav_entries(fav_archive)]
 
 
-def fav_cdn_map(paths: WeChatPaths) -> dict[str, str]:
+def fav_archive_path(paths: WeChatPaths) -> Path | None:
+    for library_dir in paths.library_dirs:
+        fav = library_dir / "fav.archive"
+        if fav.is_file():
+            return fav
+    return None
+
+
+def count_persist_stickers(paths: WeChatPaths) -> int:
+    seen: set[str] = set()
+    for emo_dir in paths.emoticon_dirs:
+        base = emo_dir / "Persist"
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if path.is_file() and len(path.name) == 32:
+                seen.add(path.name.lower())
+    return len(seen)
+
+
+def merge_persist_md5s(base_md5s: list[str], paths: WeChatPaths) -> list[str]:
+    existing = {md5.lower() for md5 in base_md5s}
+    additions: list[tuple[float, str]] = []
+    for emo_dir in paths.emoticon_dirs:
+        persist = emo_dir / "Persist"
+        if not persist.is_dir():
+            continue
+        for path in persist.rglob("*"):
+            if not path.is_file() or len(path.name) != 32:
+                continue
+            md5 = path.name.lower()
+            if md5 in existing:
+                continue
+            additions.append((path.stat().st_mtime, md5))
+            existing.add(md5)
+
+    if not additions:
+        return base_md5s
+
+    additions.sort(key=lambda item: item[0])
+    merged = list(base_md5s)
+    merged.extend(md5 for _mtime, md5 in additions)
+    print(
+        f"wxmeme: --sync-persist 追加 {len(additions)} 个新缓存表情（顺序为近似值）",
+        flush=True,
+    )
+    return merged
+
+
+def warn_if_stale_fav_archive(
+    paths: WeChatPaths,
+    fav_archive: Path,
+    md5_count: int,
+    source_label: str,
+) -> None:
+    if not source_label.startswith("fav.archive"):
+        return
+
+    persist_count = count_persist_stickers(paths)
+    fav_mtime = fav_archive.stat().st_mtime
+    db_path = None
+    db_mtime = 0.0
+    for account in paths.account_dirs:
+        candidate = resolve_emoticon_db(account)
+        if candidate and candidate.is_file():
+            db_path = candidate
+            db_mtime = max(db_mtime, candidate.stat().st_mtime)
+            wal = candidate.with_name(candidate.name + "-wal")
+            if wal.is_file():
+                db_mtime = max(db_mtime, wal.stat().st_mtime)
+
+    stale = False
+    reasons: list[str] = []
+    if persist_count and abs(persist_count - md5_count) >= 3:
+        stale = True
+        reasons.append(f"本地 4.x 缓存 {persist_count} 个，fav.archive 仅 {md5_count} 个")
+    if db_path and db_mtime > fav_mtime + 60:
+        stale = True
+        reasons.append("emoticon.db 比 fav.archive 更新")
+
+    if not stale:
+        return
+
+    print("wxmeme: 警告: 当前列表来自旧版 fav.archive，与微信里增删不同步。", flush=True)
+    for reason in reasons:
+        print(f"  - {reason}", flush=True)
+    print(
+        "  建议: 提供 --db-key / --decrypted-db，或 macOS 上尝试 --auto-db-key；"
+        "临时可用 --sync-persist 追加新表情。",
+        flush=True,
+    )
+
+
+def decrypt_emoticon_db(db_path: Path, db_key: bytes) -> Path | None:
+    return decrypt_sqlcipher4_db(db_path, db_key)
+
+
+def load_cdn_map(config: ExportConfig, paths: WeChatPaths, decrypted_db: Path | None = None) -> dict[str, str]:
     mapping: dict[str, str] = {}
+
+    if decrypted_db and decrypted_db.is_file():
+        mapping.update(emoticon_cdn_map_from_db(decrypted_db))
+
+    if config.db_key and not mapping:
+        for account in paths.account_dirs:
+            db_path = resolve_emoticon_db(account)
+            if not db_path:
+                continue
+            decoded = decrypt_emoticon_db(db_path, config.db_key)
+            if decoded:
+                mapping.update(emoticon_cdn_map_from_db(decoded))
+
     for library_dir in paths.library_dirs:
         fav = library_dir / "fav.archive"
         if not fav.is_file():
@@ -225,6 +415,7 @@ def fav_cdn_map(paths: WeChatPaths) -> dict[str, str]:
         for entry in ordered_fav_entries(fav):
             if entry.cdnurl:
                 mapping.setdefault(entry.md5, entry.cdnurl)
+
     return mapping
 
 
@@ -244,27 +435,75 @@ def resolve_emoticon_db(account_dir: Path) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+WCDB_KEYS_CANDIDATES = (
+    HOME / "Desktop" / "wcdb-key-tool" / "all_keys.json",
+    HOME / "wcdb-key-tool" / "all_keys.json",
+    HOME / "Documents" / "wcdb-key-tool" / "all_keys.json",
+)
+EMOTICON_DB_KEY = "emoticon/emoticon.db"
+
+
+def find_wcdb_keys_file(explicit: str | None) -> Path | None:
+    if explicit and explicit != "auto":
+        path = Path(explicit).expanduser()
+        return path if path.is_file() else None
+    env = os.environ.get("WXMEME_WCDB_KEYS")
+    if env:
+        path = Path(env).expanduser()
+        return path if path.is_file() else None
+    for path in WCDB_KEYS_CANDIDATES:
+        if path.is_file():
+            return path
+    return None
+
+
+def db_key_from_wcdb_keys(keys_file: Path) -> bytes | None:
+    try:
+        data = json.loads(keys_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    entry = data.get(EMOTICON_DB_KEY)
+    if isinstance(entry, dict) and entry.get("enc_key"):
+        return parse_hex_key(str(entry["enc_key"]), 32)
+
+    for key, value in data.items():
+        if key.startswith("_") or not isinstance(value, dict):
+            continue
+        if "emoticon" in key and value.get("enc_key"):
+            return parse_hex_key(str(value["enc_key"]), 32)
+    return None
+
+
+def decrypted_db_from_wcdb(keys_file: Path) -> Path | None:
+    candidate = keys_file.parent / "decrypted" / "emoticon" / "emoticon.db"
+    return candidate if candidate.is_file() else None
+
+
 def load_ordered_md5s(config: ExportConfig, paths: WeChatPaths) -> tuple[list[str], str]:
     if config.decrypted_db and config.decrypted_db.is_file():
         md5s = favorite_md5s_from_db(config.decrypted_db)
         if md5s:
             return md5s, f"emoticon.db ({config.decrypted_db})"
 
-    for account in paths.account_dirs:
-        db_path = resolve_emoticon_db(account)
-        if db_path and config.db_key:
-            decoded = decrypt_sqlcipher4_db(db_path, config.db_key)
-            if decoded:
-                md5s = favorite_md5s_from_db(decoded)
-                if md5s:
-                    return md5s, f"decrypted emoticon.db ({db_path})"
+    if not config.force_fav_archive:
+        for account in paths.account_dirs:
+            db_path = resolve_emoticon_db(account)
+            if db_path and config.db_key:
+                decoded = decrypt_emoticon_db(db_path, config.db_key)
+                if decoded:
+                    md5s = favorite_md5s_from_db(decoded)
+                    if md5s:
+                        return md5s, f"decrypted emoticon.db ({db_path})"
 
-    for library_dir in paths.library_dirs:
-        fav = library_dir / "fav.archive"
-        if fav.is_file():
-            md5s = ordered_md5s_from_fav(fav)
-            if md5s:
-                return md5s, f"fav.archive ({fav})"
+    fav = fav_archive_path(paths)
+    if fav and fav.is_file():
+        md5s = ordered_md5s_from_fav(fav)
+        if md5s:
+            if config.sync_persist:
+                md5s = merge_persist_md5s(md5s, paths)
+            warn_if_stale_fav_archive(paths, fav, len(md5s), f"fav.archive ({fav})")
+            return md5s, f"fav.archive ({fav})"
 
     return [], "none"
 
@@ -363,8 +602,9 @@ def prefetch_cdn_stickers(
         f"需 CDN 下载 {total} 个（约 1-2 分钟）…",
         flush=True,
     )
+    _set_export_status(phase="cdn", message=f"CDN 下载 0/{total}", current=0, total=total)
     cache: dict[str, tuple[bytes, str]] = {}
-    workers = min(12, max(4, (os.cpu_count() or 4) * 2))
+    workers = min(8, max(4, (os.cpu_count() or 4)))
     done = 0
 
     def fetch(md5: str) -> tuple[str, tuple[bytes, str] | None]:
@@ -384,7 +624,30 @@ def prefetch_cdn_stickers(
                 cache[md5] = result
             if done == 1 or done % 20 == 0 or done == total:
                 print(f"wxmeme: CDN 进度 {done}/{total}，已成功 {len(cache)}", flush=True)
+                _set_export_status(
+                    phase="cdn",
+                    message=f"CDN 下载 {done}/{total}（成功 {len(cache)}）",
+                    current=done,
+                    total=total,
+                )
     return cache
+
+
+def resolve_auto_db_key(args: argparse.Namespace, paths: WeChatPaths) -> None:
+    if sys.platform != "darwin":
+        raise SystemExit("--auto-db-key 目前仅支持 macOS。")
+
+    db_path = None
+    for account in paths.account_dirs:
+        candidate = resolve_emoticon_db(account)
+        if candidate and candidate.is_file():
+            db_path = candidate
+            break
+    if not db_path:
+        raise SystemExit("未找到 emoticon.db，无法自动扫描 db_key。")
+
+    key = find_db_key_from_memory(db_path, pid=args.pid)
+    args.db_key = key.hex()
 
 
 def resolve_auto_key(args: argparse.Namespace, paths: WeChatPaths) -> None:
@@ -420,6 +683,19 @@ def build_config(args: argparse.Namespace) -> ExportConfig:
     msg_key = parse_hex_key(args.msg_key) if args.msg_key else None
     decrypted_db = Path(args.decrypted_db).expanduser() if args.decrypted_db else None
 
+    wcdb_keys = getattr(args, "wcdb_keys", None)
+    if wcdb_keys is not None:
+        keys_file = find_wcdb_keys_file(wcdb_keys)
+        if not keys_file:
+            raise SystemExit("未找到 wcdb-key-tool 的 all_keys.json，请先运行 scripts/export-stickers.sh")
+        if not db_key:
+            db_key = db_key_from_wcdb_keys(keys_file)
+            if not db_key:
+                raise SystemExit(f"{keys_file} 里没有 emoticon.db 的 enc_key")
+        if not decrypted_db:
+            decrypted_db = decrypted_db_from_wcdb(keys_file)
+        print(f"wxmeme: 使用 wcdb 密钥 {keys_file}", flush=True)
+
     return ExportConfig(
         emoticon_key=emoticon_key,
         db_key=db_key,
@@ -428,10 +704,14 @@ def build_config(args: argparse.Namespace) -> ExportConfig:
         wxid=args.wxid,
         seed=args.seed,
         use_cdn=args.cdn,
+        force_fav_archive=args.force_fav_archive,
+        sync_persist=args.sync_persist,
     )
 
 
 def export_library(config: ExportConfig, paths: WeChatPaths) -> tuple[list[dict], int, int]:
+    export_status_reset()
+    _set_export_status(phase="scan", message="读取表情列表…")
     LIBRARY.mkdir(parents=True, exist_ok=True)
     for old in LIBRARY.iterdir():
         if old.is_file():
@@ -440,19 +720,39 @@ def export_library(config: ExportConfig, paths: WeChatPaths) -> tuple[list[dict]
     md5s, source_label = load_ordered_md5s(config, paths)
     if not md5s:
         (LIBRARY / "index.json").write_text("[]", encoding="utf-8")
+        _set_export_status(done=True, phase="ready", message="完成", current=0, total=0)
         return [], 0, 0
 
-    cdn_map = fav_cdn_map(paths) if config.use_cdn else {}
+    print(f"wxmeme: 顺序来源 {source_label}", flush=True)
+    _set_export_status(message=f"顺序来源 {source_label}", total=len(md5s))
+
+    decrypted_db = config.decrypted_db
+    if not decrypted_db and config.db_key:
+        for account in paths.account_dirs:
+            db_path = resolve_emoticon_db(account)
+            if db_path:
+                decrypted_db = decrypt_emoticon_db(db_path, config.db_key)
+                break
+
+    cdn_map = load_cdn_map(config, paths, decrypted_db) if config.use_cdn else {}
     cdn_cache: dict[str, tuple[bytes, str]] = {}
     if config.use_cdn:
-        print(f"wxmeme: 启用 CDN 回退（fav.archive 共 {len(cdn_map)} 个 CDN 链接）", flush=True)
+        print(f"wxmeme: 启用 CDN 回退（共 {len(cdn_map)} 个 CDN 链接）", flush=True)
         cdn_cache = prefetch_cdn_stickers(md5s, config, paths, cdn_map)
 
     print(f"wxmeme: 正在写入 {len(md5s)} 个表情到 {LIBRARY} …", flush=True)
+    _set_export_status(phase="write", message=f"写入文件 0/{len(md5s)}", current=0, total=len(md5s))
     items: list[dict] = []
     skipped = 0
     for index, md5 in enumerate(md5s, start=1):
         body, ext, source, mode = load_sticker_bytes(md5, config, paths, cdn_map, cdn_cache)
+        if index == 1 or index % 40 == 0 or index == len(md5s):
+            _set_export_status(
+                phase="write",
+                message=f"写入文件 {index}/{len(md5s)}",
+                current=index,
+                total=len(md5s),
+            )
         record = {
             "index": index,
             "md5": md5,
@@ -482,6 +782,7 @@ def export_library(config: ExportConfig, paths: WeChatPaths) -> tuple[list[dict]
         items.append(record)
 
     (LIBRARY / "index.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    _set_export_status(done=True, phase="ready", message="导出完成", current=len(items), total=len(items))
     return items, skipped, len(items)
 
 
@@ -499,43 +800,175 @@ PAGE = """<!DOCTYPE html>
     .bar { display: flex; gap: 10px; align-items: center; margin: 18px 0 22px; flex-wrap: wrap; }
     a.btn, button { border: 0; border-radius: 8px; padding: 8px 14px; background: #07c160; color: #063; font-weight: 700; text-decoration: none; cursor: pointer; }
     button.ghost { background: #222; color: #ddd; }
+    button:disabled { opacity: 0.5; cursor: wait; }
+    .progress { margin: 0 0 18px; padding: 14px 16px; background: #1b1b1b; border: 1px solid #2a2a2a; border-radius: 12px; }
+    .progress.hidden { display: none; }
+    .progress-track { height: 6px; background: #2a2a2a; border-radius: 999px; overflow: hidden; margin-top: 10px; }
+    .progress-fill { height: 100%; width: 0; background: #07c160; transition: width 0.25s ease; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 10px; }
-    .card { background: #1b1b1b; border: 1px solid #2a2a2a; border-radius: 12px; overflow: hidden; aspect-ratio: 1; position: relative; display: grid; place-items: center; }
-    .card.skip { border-style: dashed; color: #666; font-size: 12px; text-align: center; padding: 8px; }
-    .card img { width: 100%; height: 100%; object-fit: contain; }
-    .card span { position: absolute; left: 6px; bottom: 6px; padding: 1px 6px; border-radius: 6px; background: rgba(0,0,0,.65); font-size: 11px; }
+    .card {
+      background: #1b1b1b; border: 1px solid #2a2a2a; border-radius: 12px; overflow: hidden;
+      aspect-ratio: 1; position: relative; display: grid; place-items: center; cursor: pointer;
+    }
+    .card.skip { border-style: dashed; color: #666; font-size: 12px; text-align: center; padding: 8px; cursor: default; }
+    .card img { width: 100%; height: 100%; object-fit: contain; display: block; background: #252525; }
+    .card .ph {
+      position: absolute; inset: 0; display: grid; place-items: center; color: #555; font-size: 11px;
+      pointer-events: none;
+    }
+    .card span { position: absolute; left: 6px; bottom: 6px; padding: 1px 6px; border-radius: 6px; background: rgba(0,0,0,.65); font-size: 11px; pointer-events: none; }
     .count { color: #07c160; font-variant-numeric: tabular-nums; font-weight: 700; }
+    .toast { position: fixed; right: 18px; bottom: 18px; padding: 10px 14px; background: #222; border: 1px solid #333; border-radius: 8px; opacity: 0; transition: opacity 0.2s; pointer-events: none; }
+    .toast.show { opacity: 1; }
   </style>
 </head>
 <body>
   <h1>我的表情</h1>
-  <p class="muted">按微信表情面板顺序导出。提供密钥后会尝试解密本地缓存。</p>
+  <p class="muted">按微信表情面板顺序导出。点击表情可保存到下载目录。</p>
+  <div id="progress" class="progress hidden">
+    <div id="progressText">正在导出…</div>
+    <div class="progress-track"><div id="progressFill" class="progress-fill"></div></div>
+  </div>
   <div class="bar">
     <span>面板 <span class="count" id="total">0</span> 个，可导出 <span class="count" id="count">0</span> 个</span>
-    <a class="btn" href="/zip">打包下载 ZIP</a>
+    <button class="btn" id="zipBtn">打包下载 ZIP</button>
     <button class="ghost" id="reload">重新扫描</button>
   </div>
   <div class="grid" id="grid"></div>
+  <div id="toast" class="toast"></div>
   <script>
-    async function load() {
+    const grid = document.getElementById("grid");
+    const progressEl = document.getElementById("progress");
+    const progressText = document.getElementById("progressText");
+    const progressFill = document.getElementById("progressFill");
+    const toastEl = document.getElementById("toast");
+    let toastTimer = null;
+
+    function showToast(msg) {
+      toastEl.textContent = msg;
+      toastEl.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2200);
+    }
+
+    function hasNativeApi() {
+      return window.pywebview && window.pywebview.api;
+    }
+
+    async function downloadSticker(name) {
+      if (hasNativeApi()) {
+        const r = await window.pywebview.api.save_sticker(name);
+        showToast(r.ok ? "已保存：" + r.path.split("/").pop() : (r.error || "保存失败"));
+        return;
+      }
+      const resp = await fetch("/library/" + encodeURIComponent(name));
+      const blob = await resp.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    async function downloadZip() {
+      const btn = document.getElementById("zipBtn");
+      btn.disabled = true;
+      try {
+        if (hasNativeApi()) {
+          showToast("正在打包…");
+          const r = await window.pywebview.api.save_zip();
+          showToast(r.ok ? "ZIP 已保存" : (r.error || "打包失败"));
+          return;
+        }
+        const resp = await fetch("/zip");
+        const blob = await resp.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "wxmeme-stickers.zip";
+        a.click();
+        URL.revokeObjectURL(a.href);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function renderCard(item, eager) {
+      const idx = String(item.index).padStart(3, "0");
+      if (!item.exported) {
+        const el = document.createElement("div");
+        el.className = "card skip";
+        el.innerHTML = `<span>${idx}</span>${item.reason === "encrypted" ? "需密钥解密" : "缺失"}`;
+        return el;
+      }
+      const el = document.createElement("div");
+      el.className = "card";
+      el.title = "点击保存 " + item.name;
+      const lazy = eager ? "" : ' loading="lazy"';
+      el.innerHTML = `<div class="ph">加载中</div><img src="/library/${item.name}" alt="" decoding="async"${lazy}><span>${idx} · ${item.ext}</span>`;
+      const img = el.querySelector("img");
+      const ph = el.querySelector(".ph");
+      img.onload = () => ph?.remove();
+      img.onerror = () => { if (ph) ph.textContent = "加载失败"; };
+      el.onclick = () => downloadSticker(item.name);
+      return el;
+    }
+
+    async function loadGrid() {
       const items = await (await fetch("/api/list")).json();
       const exported = items.filter(item => item.exported);
       document.getElementById("total").textContent = items.length;
       document.getElementById("count").textContent = exported.length;
-      document.getElementById("grid").innerHTML = items.map(item => {
-        const idx = String(item.index).padStart(3, "0");
-        if (item.exported) {
-          return `<a class="card" href="/library/${item.name}" download="${item.name}"><img src="/library/${item.name}" alt=""><span>${idx} · ${item.ext}</span></a>`;
-        }
-        return `<div class="card skip"><span>${idx}</span>${item.reason === "encrypted" ? "需密钥解密" : "缺失"}</div>`;
-      }).join("");
+      grid.replaceChildren();
+      const batch = 48;
+      let i = 0;
+      function appendBatch() {
+        const frag = document.createDocumentFragment();
+        const end = Math.min(i + batch, items.length);
+        for (; i < end; i += 1) frag.appendChild(renderCard(items[i], i < 96));
+        grid.appendChild(frag);
+        if (i < items.length) requestAnimationFrame(appendBatch);
+      }
+      appendBatch();
     }
-    document.getElementById("reload").onclick = async () => { await fetch("/api/rescan", { method: "POST" }); await load(); };
-    load();
+
+    async function pollStatus() {
+      const s = await (await fetch("/api/status")).json();
+      if (!s.done) {
+        progressEl.classList.remove("hidden");
+        progressText.textContent = s.message || "正在导出…";
+        progressFill.style.width = s.total > 0 ? ((100 * s.current / s.total).toFixed(1) + "%") : "8%";
+        setTimeout(pollStatus, 700);
+        return;
+      }
+      progressEl.classList.add("hidden");
+      await loadGrid();
+    }
+
+    document.getElementById("zipBtn").onclick = downloadZip;
+    document.getElementById("reload").onclick = async () => {
+      progressEl.classList.remove("hidden");
+      progressText.textContent = "重新扫描…";
+      await fetch("/api/rescan", { method: "POST" });
+      await pollStatus();
+    };
+    pollStatus();
   </script>
 </body>
 </html>
 """
+
+
+def build_stickers_zip() -> Path:
+    items = json.loads((LIBRARY / "index.json").read_text(encoding="utf-8")) if (LIBRARY / "index.json").exists() else []
+    zip_path = LIBRARY.parent / "wxmeme-stickers.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for item in items:
+            if not item.get("exported"):
+                continue
+            path = LIBRARY / item["name"]
+            if path.is_file():
+                zf.write(path, item["name"])
+    return zip_path
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -563,16 +996,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             payload = index.read_text(encoding="utf-8") if index.exists() else "[]"
             self._bytes(payload.encode("utf-8"), "application/json; charset=utf-8")
             return
+        if self.path == "/api/status":
+            self._json(export_status_snapshot())
+            return
         if self.path == "/zip":
-            items = json.loads((LIBRARY / "index.json").read_text(encoding="utf-8")) if (LIBRARY / "index.json").exists() else []
-            zip_path = LIBRARY.parent / "wxmeme-stickers.zip"
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for item in items:
-                    if not item.get("exported"):
-                        continue
-                    path = LIBRARY / item["name"]
-                    if path.is_file():
-                        zf.write(path, item["name"])
+            zip_path = build_stickers_zip()
             data = zip_path.read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
@@ -650,11 +1078,15 @@ def cmd_decrypt_msg(config: ExportConfig, input_dir: Path, output_dir: Path, tal
     return 0
 
 
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 def serve(port: int, open_browser: bool, config: ExportConfig, paths: WeChatPaths) -> None:
     Handler.config = config
     Handler.paths = paths
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
+    with ThreadingHTTPServer(("127.0.0.1", port), Handler) as httpd:
         url = f"http://127.0.0.1:{port}"
         print(f"wxmeme: {url}", flush=True)
         if open_browser:
@@ -663,6 +1095,17 @@ def serve(port: int, open_browser: bool, config: ExportConfig, paths: WeChatPath
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nwxmeme: bye")
+
+
+def start_server_thread(port: int, config: ExportConfig, paths: WeChatPaths) -> threading.Thread:
+    thread = threading.Thread(
+        target=serve,
+        args=(port, False, config, paths),
+        daemon=True,
+        name="wxmeme-http",
+    )
+    thread.start()
+    return thread
 
 
 def main() -> int:
@@ -681,12 +1124,33 @@ def main() -> int:
     parser.add_argument("--msg-output-dir", default="decoded_msg", help="MSG 解密输出目录")
     parser.add_argument("--msg-talker", help="解密后统计 Type=47 的联系人 id")
     parser.add_argument("--auto-key", action="store_true", help="从运行中的微信进程自动扫描 seed（macOS）")
+    parser.add_argument("--auto-db-key", action="store_true", help="从运行中的微信进程自动扫描 emoticon.db 密钥（macOS）")
     parser.add_argument("--scan-seed", action="store_true", help="只扫描并打印 seed / emoticon_key")
-    parser.add_argument("--cdn", action="store_true", help="本地解密失败时，从 fav.archive 的 CDN 链接下载")
+    parser.add_argument("--scan-db-key", action="store_true", help="只扫描并打印 emoticon.db 的 db_key")
+    parser.add_argument("--cdn", action="store_true", help="本地解密失败时，从 CDN 链接下载")
+    parser.add_argument("--sync-persist", action="store_true", help="fav.archive 模式下，把 4.x 本地新缓存追加到列表末尾")
+    parser.add_argument("--wcdb-keys", nargs="?", const="auto", metavar="PATH", help="从 wcdb-key-tool 的 all_keys.json 读取 emoticon.db 密钥")
+    parser.add_argument("--force-fav-archive", action="store_true", help="强制使用旧版 fav.archive，忽略 emoticon.db")
     parser.add_argument("--pid", type=int, help="指定微信进程 PID（默认自动选择主进程）")
     args = parser.parse_args()
 
     paths = discover_paths()
+
+    if args.auto_db_key or args.scan_db_key:
+        try:
+            resolve_auto_db_key(args, paths)
+        except (PermissionError, RuntimeError, OSError) as exc:
+            print(f"错误: {exc}", file=sys.stderr, flush=True)
+            print(
+                "微信 4.1+ 可能需外部工具提取 db_key，例如 wcdb-key-tool / LLDB，然后：\n"
+                "  python3 exporter/wxmeme.py --db-key YOUR_64_HEX --cdn --scan-only",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+        if args.scan_db_key:
+            print(f"db_key={args.db_key}")
+            return 0
 
     if args.auto_key or args.scan_seed:
         try:
@@ -694,8 +1158,8 @@ def main() -> int:
         except (PermissionError, RuntimeError, OSError) as exc:
             print(f"错误: {exc}", file=sys.stderr, flush=True)
             print(
-                "Mac 无法读微信内存时，可直接用 CDN 下载（不需要 seed）：\n"
-                "  python3 exporter/wxmeme.py --cdn --scan-only",
+                "Mac 无法读微信内存时，可尝试 --auto-db-key；或临时用 --cdn --sync-persist：\n"
+                "  python3 exporter/wxmeme.py --cdn --sync-persist --scan-only",
                 file=sys.stderr,
                 flush=True,
             )

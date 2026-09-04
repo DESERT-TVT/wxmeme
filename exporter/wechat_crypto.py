@@ -187,6 +187,14 @@ def open_sqlite(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info([{table}])").fetchall()}
+
+
+def _cdn_url_column(columns: set[str]) -> str | None:
+    return next((name for name in ("cdn_url", "cdnurl", "cdnUrl") if name in columns), None)
+
+
 def favorite_md5s_from_db(db_path: Path) -> list[str]:
     conn = open_sqlite(db_path)
     try:
@@ -194,12 +202,16 @@ def favorite_md5s_from_db(db_path: Path) -> list[str]:
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
+        if "kFavEmoticonOrderTable" in tables:
+            rows = conn.execute("SELECT md5 FROM kFavEmoticonOrderTable").fetchall()
+            md5s = [str(row[0]).lower() for row in rows if row[0]]
+            if md5s:
+                return md5s
+
         if "kNonStoreEmoticonTable" not in tables:
             return []
 
-        columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(kNonStoreEmoticonTable)").fetchall()
-        }
+        columns = _table_columns(conn, "kNonStoreEmoticonTable")
         order_col = next(
             (name for name in ("sort_order_", "sortOrder", "sort_", "sort", "index_") if name in columns),
             None,
@@ -210,6 +222,44 @@ def favorite_md5s_from_db(db_path: Path) -> list[str]:
         return [str(row[0]).lower() for row in conn.execute(query).fetchall() if row[0]]
     finally:
         conn.close()
+
+
+def emoticon_cdn_map_from_db(db_path: Path) -> dict[str, str]:
+    conn = open_sqlite(db_path)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if "kNonStoreEmoticonTable" not in tables:
+            return {}
+
+        columns = _table_columns(conn, "kNonStoreEmoticonTable")
+        cdn_col = _cdn_url_column(columns)
+        if not cdn_col:
+            return {}
+
+        mapping: dict[str, str] = {}
+        for row in conn.execute(f"SELECT md5, [{cdn_col}] FROM kNonStoreEmoticonTable"):
+            md5 = str(row[0] or "").lower()
+            url = str(row[1] or "")
+            if len(md5) == 32 and url.startswith("http"):
+                mapping.setdefault(md5, url)
+        return mapping
+    finally:
+        conn.close()
+
+
+def verify_sqlcipher4_db_key(db_path: Path, raw_key: bytes) -> bool:
+    if len(raw_key) != 32:
+        return False
+    try:
+        page1 = db_path.read_bytes()[:WCDB_PAGESIZE]
+    except OSError:
+        return False
+    if len(page1) < WCDB_PAGESIZE:
+        return False
+    return _verify_sqlcipher4_key(raw_key, page1)
 
 
 def sticker_md5s_from_msg_db(db_path: Path, talker: str) -> list[str]:

@@ -11,9 +11,10 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from wechat_crypto import decrypt_emoticon_bytes, derive_emoticon_key
+from wechat_crypto import decrypt_emoticon_bytes, derive_emoticon_key, verify_sqlcipher4_db_key
 
 RE_SEED = re.compile(rb"(?<![0-9])(\d{8,12})(?![0-9])")
+RE_HEX64 = re.compile(rb"(?<![0-9a-fA-F])([0-9a-fA-F]{64})(?![0-9a-fA-F])")
 CHUNK = 2 * 1024 * 1024
 MAX_REGION = 200 * 1024 * 1024
 SEED_MIN = 100_000_000
@@ -239,3 +240,48 @@ def find_encrypted_sample(sticker_index: dict[str, Path], identify_file) -> Path
         if path.is_file() and identify_file(path) is None:
             return path
     raise RuntimeError("没有找到加密表情样本文件，请先在微信里打开一次表情面板。")
+
+
+def _collect_db_key_candidates(data: bytes, candidates: set[bytes]) -> None:
+    for match in RE_HEX64.finditer(data):
+        try:
+            candidates.add(bytes.fromhex(match.group(1).decode("ascii")))
+        except ValueError:
+            continue
+
+    for offset in range(0, max(0, len(data) - 32), 8):
+        candidates.add(data[offset : offset + 32])
+
+
+def find_db_key_from_memory(db_path: Path, pid: int | None = None) -> bytes:
+    if not db_path.is_file():
+        raise RuntimeError(f"找不到数据库: {db_path}")
+
+    target_pid = pid or find_wechat_pid()
+    if not target_pid:
+        raise RuntimeError("未找到运行中的微信主进程，请先打开并登录微信。")
+
+    task = _open_task(target_pid)
+    candidates: set[bytes] = set()
+    regions = _enum_regions(task)
+    print(f"wxmeme: 扫描 emoticon.db 密钥（PID {target_pid}，{len(regions)} 个内存区域）…", flush=True)
+
+    for base, size in regions:
+        offset = 0
+        while offset < size:
+            chunk_size = min(CHUNK, size - offset)
+            chunk = _read_region(task, base + offset, chunk_size)
+            if chunk:
+                _collect_db_key_candidates(chunk, candidates)
+            offset += chunk_size
+
+    print(f"wxmeme: 找到 {len(candidates)} 个 db_key 候选，正在验证…", flush=True)
+    for key in candidates:
+        if verify_sqlcipher4_db_key(db_path, key):
+            print(f"wxmeme: db_key={key.hex()}", flush=True)
+            return key
+
+    raise RuntimeError(
+        "未能在内存中找到 emoticon.db 密钥。"
+        "微信 4.1+ 可能不再缓存明文密钥，请用 LLDB / wcdb-key-tool 提取后传 --db-key。"
+    )
