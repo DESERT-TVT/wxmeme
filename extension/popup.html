@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>wxmeme</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div>
+        <div class="brand">wxmeme</div>
+        <div class="sub">把微信里看到的表情收进本地</div>
+      </div>
+      <span class="count" id="count">0</span>
+    </header>
+
+    <section class="actions">
+      <button id="scan" type="button">扫描当前页</button>
+      <button id="zip" type="button" class="primary">打包下载</button>
+      <button id="clear" type="button" class="ghost">清空</button>
+    </section>
+
+    <label class="drop" id="drop">
+      <input id="file" type="file" accept="image/gif,image/png,image/webp,image/jpeg" multiple hidden />
+      也可把表情拖进来，或从剪贴板粘贴
+    </label>
+
+    <main id="grid" class="grid"></main>
+    <p id="empty" class="empty">还没有表情。打开微信网页版或公众号文章，插件会收集页面上的表情图。</p>
+    <p id="status" class="status"></p>
+
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>

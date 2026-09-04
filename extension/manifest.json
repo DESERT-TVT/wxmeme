@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "wxmeme 表情收集器",
+  "version": "1.0.0",
+  "description": "从微信网页版、公众号文章等页面收集可见表情包，打包下载到本地供其他软件使用。",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "wxmeme 表情收集器",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "contextMenus",
+    "downloads",
+    "storage",
+    "unlimitedStorage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://wx.qq.com/*",
+    "https://wx2.qq.com/*",
+    "https://web.weixin.qq.com/*",
+    "https://web.wechat.com/*",
+    "https://*.weixin.qq.com/*",
+    "https://*.qpic.cn/*",
+    "https://*.qq.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://wx.qq.com/*",
+        "https://wx2.qq.com/*",
+        "https://web.weixin.qq.com/*",
+        "https://web.wechat.com/*",
+        "https://*.weixin.qq.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
