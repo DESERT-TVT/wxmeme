@@ -10,16 +10,20 @@ import sys
 from pathlib import Path
 
 WCDB_DIR = Path(os.environ.get("WCDB_DIR", Path.home() / "Desktop" / "wcdb-key-tool"))
-if str(WCDB_DIR) not in sys.path:
-    sys.path.insert(0, str(WCDB_DIR))
 
-try:
-    import wcdb_key_tool_macos as wcdb
-except ImportError as exc:
-    raise SystemExit(f"未找到 wcdb-key-tool: {WCDB_DIR}\n请先运行 scripts/export-stickers.sh") from exc
+
+def _load_wcdb():
+    if str(WCDB_DIR) not in sys.path:
+        sys.path.insert(0, str(WCDB_DIR))
+    try:
+        import wcdb_key_tool_macos as wcdb
+    except ImportError as exc:
+        raise SystemExit(f"未找到 wcdb-key-tool: {WCDB_DIR}\n请先运行 scripts/export-stickers.sh") from exc
+    return wcdb
 
 
 def extract(db_dir: Path, output: Path, timeout: int) -> Path:
+    wcdb = _load_wcdb()
     db_files, salt_to_dbs = wcdb.collect_db_files(str(db_dir))
     if not db_files:
         raise SystemExit(f"在 {db_dir} 未找到 .db 文件")

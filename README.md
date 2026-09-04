@@ -91,6 +91,18 @@ python exporter\wxmeme.py --cdn --sync-persist --scan-only
 
 导出目录：`%USERPROFILE%\Downloads\wxmeme\library`
 
+**Windows 打包常见问题：**
+
+1. **在 Mac 上运行此脚本会报错** — 必须在 Windows 电脑上打包，Mac 请用 `build-standalone-app.sh`
+2. **`python` 找不到** — 安装 Python 时勾选 “Add python.exe to PATH”，或用 `py -3` 启动
+3. **`ExecutionPolicy` 报错** — 用下面完整命令（已含 Bypass）
+4. **`pyinstaller` 找不到** — 新脚本已改为 `python -m PyInstaller`，一般不会再出现
+
+```powershell
+cd C:\path\to\wxmeme
+powershell -ExecutionPolicy Bypass -File scripts\build-standalone-windows.ps1
+```
+
 ### 一次打包全部（macOS）
 
 ```bash

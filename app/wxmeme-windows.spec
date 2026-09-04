@@ -23,7 +23,6 @@ a = Analysis(
         "Crypto.Cipher",
         "Crypto.Cipher.AES",
         "wechat_crypto",
-        "wcdb_extract",
         "wxmeme",
         "gui",
         "paths",
